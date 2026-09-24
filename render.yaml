@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: alpha-wingo-predictor
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn ALPHA_WINGO_PREDICTOR_COLOUR:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DATABASE
+        sync: false

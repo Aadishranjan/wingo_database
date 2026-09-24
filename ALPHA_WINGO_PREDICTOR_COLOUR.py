@@ -1,12 +1,15 @@
 import json
 import os
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+from flask import Flask, jsonify, request
 
 API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
 GAME = "WinGo_1M"
@@ -45,6 +48,14 @@ def load_local_env() -> None:
 load_local_env()
 MONGO_CLIENT: Any = None
 PREDICTION_COLLECTION: Any = None
+app = Flask(__name__)
+worker_lock = threading.Lock()
+worker_started = False
+worker_status: Dict[str, Any] = {
+    "running": False,
+    "lastCycleAt": None,
+    "lastError": None,
+}
 
 
 def connect_mongodb() -> tuple[Any, Any]:
@@ -301,25 +312,77 @@ def run_cycle(prev_prediction: Optional[str], trend_bias: str) -> tuple[Optional
     return prediction, trend_bias, True
 
 
-def main() -> None:
-    global MONGO_CLIENT, PREDICTION_COLLECTION
-    try:
-        MONGO_CLIENT, PREDICTION_COLLECTION = connect_mongodb()
-        print_line("[MONGO] Connected. Saving prediction records to wingo_prediction_history.", color=GREEN)
-    except Exception as exc:
-        print_line(f"[MONGO] Could not initialize MongoDB: {exc}", color=RED)
-        raise SystemExit(1)
-
+def prediction_worker() -> None:
     prev_prediction: Optional[str] = None
     trend_bias = "BIG" if random.random() > 0.5 else "SMALL"
-
-    try:
-        while True:
+    worker_status["running"] = True
+    while True:
+        try:
             prev_prediction, trend_bias, _ = run_cycle(prev_prediction, trend_bias)
+            worker_status["lastCycleAt"] = datetime.now(timezone.utc).isoformat()
+            worker_status["lastError"] = None
             time.sleep(3)
-    except KeyboardInterrupt:
-        print_line("", color=RED)
-        print_status("🛑 EXIT", "👋 Stopped by user.", color=RED)
+        except Exception as exc:
+            worker_status["lastError"] = str(exc)
+            print_line(f"[ERROR] Prediction loop failed: {exc}", color=RED)
+            time.sleep(5)
+
+
+def start_prediction_worker() -> None:
+    global worker_started, MONGO_CLIENT, PREDICTION_COLLECTION
+    with worker_lock:
+        if worker_started:
+            return
+        if PREDICTION_COLLECTION is None:
+            MONGO_CLIENT, PREDICTION_COLLECTION = connect_mongodb()
+            print_line("[MONGO] Connected. Saving prediction records to wingo_prediction_history.", color=GREEN)
+        threading.Thread(target=prediction_worker, name="wingo-prediction-worker", daemon=True).start()
+        worker_started = True
+
+
+@app.before_request
+def ensure_prediction_worker() -> None:
+    start_prediction_worker()
+
+
+@app.get("/")
+def home():
+    return jsonify({
+        "service": "Alpha Wingo Predictor",
+        "status": "online",
+        "endpoints": {"health": "/health", "history": "/api/history?limit=20"},
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", **worker_status})
+
+
+@app.get("/api/history")
+def prediction_history():
+    if PREDICTION_COLLECTION is None:
+        return jsonify({"error": "MongoDB is not connected"}), 503
+    try:
+        limit = max(1, min(request.args.get("limit", default=20, type=int), 100))
+        records = list(
+            PREDICTION_COLLECTION.find({})
+            .sort("createdAt", -1)
+            .limit(limit)
+        )
+        for record in records:
+            record["_id"] = str(record["_id"])
+            for key, value in record.items():
+                if isinstance(value, datetime):
+                    record[key] = value.isoformat()
+        return jsonify({"count": len(records), "records": records})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+def main() -> None:
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
 
 
 if __name__ == "__main__":
