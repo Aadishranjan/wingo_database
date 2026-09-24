@@ -1,12 +1,15 @@
 import json
+import os
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
 API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
+GAME = "WinGo_1M"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 10)",
     "Referer": "https://hgnice.biz",
@@ -19,6 +22,48 @@ YELLOW = "\033[33m"
 MAGENTA = "\033[35m"
 BLUE = "\033[34m"
 RESET = "\033[0m"
+
+
+def load_local_env() -> None:
+    """Load simple KEY=value settings from the script's .env without overriding the process env."""
+    env_file = Path(__file__).with_name(".env")
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("\"'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_local_env()
+MONGO_CLIENT: Any = None
+PREDICTION_COLLECTION: Any = None
+
+
+def connect_mongodb() -> tuple[Any, Any]:
+    """Connect to the configured database and use only the prediction collection."""
+    uri = os.getenv("MONGO_URI")
+    database_name = os.getenv("MONGO_DATABASE")
+    if not uri or not database_name:
+        raise RuntimeError("Set MONGO_URI and MONGO_DATABASE in .env or the process environment.")
+    try:
+        from pymongo import MongoClient
+    except ImportError as exc:
+        raise RuntimeError("MongoDB support requires pymongo. Install it with: python -m pip install pymongo") from exc
+
+    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
+    client.admin.command("ping")
+    db = client[database_name]
+    predictions = db["wingo_prediction_history"]
+    predictions.create_index([("game", 1), ("period", 1)], unique=True)
+    return client, predictions
 
 
 def print_line(text: str, color: str = GREEN) -> None:
@@ -117,7 +162,8 @@ def fetch_latest() -> List[Dict[str, Any]]:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = response.read().decode("utf-8")
         data = json.loads(payload)
-        return data.get("data", {}).get("list", []) or []
+        history = data.get("data", {}).get("list", []) or []
+        return history
     except (urllib.error.URLError, ValueError, TimeoutError, json.JSONDecodeError) as exc:
         print_line(f"[ERROR] Failed to fetch history: {exc}")
         return []
@@ -197,12 +243,41 @@ def run_cycle(prev_prediction: Optional[str], trend_bias: str) -> tuple[Optional
     )
     print_status("🎲 RESULT", "🟡 WAITING", color=YELLOW)
 
+    if PREDICTION_COLLECTION is not None:
+        PREDICTION_COLLECTION.update_one(
+            {"game": GAME, "period": current_period},
+            {"$setOnInsert": {
+                "game": GAME,
+                "period": current_period,
+                "prediction": prediction,
+                "predictedNumbers": [predicted_number_1, predicted_number_2],
+                "trend": trend,
+                "trendStrength": trend_strength,
+                "createdAt": datetime.now(timezone.utc),
+                "status": "pending",
+            }},
+            upsert=True,
+        )
+
     result = wait_for_result(current_period)
     if result["found"]:
         actual_num = result["number"]
         actual_type = get_result_type(actual_num)
         win = actual_type == prediction
         number_hit = actual_num in (predicted_number_1, predicted_number_2)
+        if PREDICTION_COLLECTION is not None:
+            PREDICTION_COLLECTION.update_one(
+                {"game": GAME, "period": current_period},
+                {"$set": {
+                    "status": "completed",
+                    "actualNumber": actual_num,
+                    "actualType": actual_type,
+                    "predictionWon": win,
+                    "numberHit": number_hit,
+                    "completedAt": datetime.now(timezone.utc),
+                }},
+                upsert=True,
+            )
 
         result_emoji = "🔴" if actual_type == "SMALL" else "🟢"
         number_colour = get_number_color(actual_num)
@@ -227,6 +302,14 @@ def run_cycle(prev_prediction: Optional[str], trend_bias: str) -> tuple[Optional
 
 
 def main() -> None:
+    global MONGO_CLIENT, PREDICTION_COLLECTION
+    try:
+        MONGO_CLIENT, PREDICTION_COLLECTION = connect_mongodb()
+        print_line("[MONGO] Connected. Saving prediction records to wingo_prediction_history.", color=GREEN)
+    except Exception as exc:
+        print_line(f"[MONGO] Could not initialize MongoDB: {exc}", color=RED)
+        raise SystemExit(1)
+
     prev_prediction: Optional[str] = None
     trend_bias = "BIG" if random.random() > 0.5 else "SMALL"
 
